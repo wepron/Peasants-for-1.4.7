@@ -21,10 +21,19 @@ namespace Peasants
         {
             get
             {
-                TextObject text = new TextObject("{NAME}\n(Age : {AGE})", null);
-                text.SetTextVariable("NAME", _hero.Name);
-                text.SetTextVariable("AGE", (int)_hero.Age);
-                return text.ToString();
+                try
+                {
+                    if (_hero == null) return "?";
+
+                    TextObject text = new TextObject("{NAME}\n(Age : {AGE})", null);
+                    text.SetTextVariable("NAME", _hero.Name);
+                    text.SetTextVariable("AGE", (int)_hero.Age);
+                    return text.ToString();
+                }
+                catch
+                {
+                    return "?";
+                }
             }
         }
 
@@ -60,16 +69,40 @@ namespace Peasants
         {
             _hero = hero;
             UnitCharacter = new CharacterViewModel(StanceTypes.None);
-            UnitCharacter.FillFrom(_hero.CharacterObject, -1);
+
+            try
+            {
+                if (_hero?.CharacterObject != null)
+                {
+                    UnitCharacter.FillFrom(_hero.CharacterObject, -1);
+                }
+            }
+            catch (System.Exception ex)
+            {
+                InformationManager.DisplayMessage(new InformationMessage(
+                    "[Peasants] Card FillFrom error: " + ex.Message, Colors.Red));
+            }
+
             Skills = new MBBindingList<EncyclopediaSkillVM>();
-            Skills.Add(new EncyclopediaSkillVM(DefaultSkills.OneHanded, _hero.GetSkillValue(DefaultSkills.OneHanded)));
-            Skills.Add(new EncyclopediaSkillVM(DefaultSkills.TwoHanded, _hero.GetSkillValue(DefaultSkills.TwoHanded)));
-            Skills.Add(new EncyclopediaSkillVM(DefaultSkills.Polearm, _hero.GetSkillValue(DefaultSkills.Polearm)));
-            Skills.Add(new EncyclopediaSkillVM(DefaultSkills.Bow, _hero.GetSkillValue(DefaultSkills.Bow)));
-            Skills.Add(new EncyclopediaSkillVM(DefaultSkills.Crossbow, _hero.GetSkillValue(DefaultSkills.Crossbow)));
-            Skills.Add(new EncyclopediaSkillVM(DefaultSkills.Throwing, _hero.GetSkillValue(DefaultSkills.Throwing)));
-            Skills.Add(new EncyclopediaSkillVM(DefaultSkills.Athletics, _hero.GetSkillValue(DefaultSkills.Athletics)));
-            Skills.Add(new EncyclopediaSkillVM(DefaultSkills.Riding, _hero.GetSkillValue(DefaultSkills.Riding)));
+
+            if (_hero == null) return;
+
+            try
+            {
+                Skills.Add(new EncyclopediaSkillVM(DefaultSkills.OneHanded, _hero.GetSkillValue(DefaultSkills.OneHanded)));
+                Skills.Add(new EncyclopediaSkillVM(DefaultSkills.TwoHanded, _hero.GetSkillValue(DefaultSkills.TwoHanded)));
+                Skills.Add(new EncyclopediaSkillVM(DefaultSkills.Polearm, _hero.GetSkillValue(DefaultSkills.Polearm)));
+                Skills.Add(new EncyclopediaSkillVM(DefaultSkills.Bow, _hero.GetSkillValue(DefaultSkills.Bow)));
+                Skills.Add(new EncyclopediaSkillVM(DefaultSkills.Crossbow, _hero.GetSkillValue(DefaultSkills.Crossbow)));
+                Skills.Add(new EncyclopediaSkillVM(DefaultSkills.Throwing, _hero.GetSkillValue(DefaultSkills.Throwing)));
+                Skills.Add(new EncyclopediaSkillVM(DefaultSkills.Athletics, _hero.GetSkillValue(DefaultSkills.Athletics)));
+                Skills.Add(new EncyclopediaSkillVM(DefaultSkills.Riding, _hero.GetSkillValue(DefaultSkills.Riding)));
+            }
+            catch (System.Exception ex)
+            {
+                InformationManager.DisplayMessage(new InformationMessage(
+                    "[Peasants] Card skills error: " + ex.Message, Colors.Red));
+            }
         }
 
         // Помощник для логов, чтобы не спотыкаться о null-имена
@@ -88,42 +121,20 @@ namespace Peasants
                 if (PeasantsBehavior.selectedHero != null)
                 {
                     // ===================== БРАК =====================
-                    //
-                    // Причина, по которой брак раньше не срабатывал:
-                    // Hero.CanMarry() в 1.4.7 возвращает false, если у героя НЕТ КЛАНА.
-                    // MarriageAction.Apply() сначала проверяет
-                    //     firstHero.CanMarry() && secondHero.CanMarry()
-                    // и, если хоть один false, тихо выходит, не выставляя Spouse.
-                    //
-                    // В 1.4.7 в публичном API нет класса ChangeClanAction,
-                    // но сеттер Hero.Clan доступен, поэтому используем прямое
-                    // присваивание. (Оно не поднимает событие Clan.OnHeroAdded,
-                    // но для наших целей — регистрация героя в клане игрока и
-                    // последующий MarriageAction — этого достаточно.)
-
-                    // 1. Состояние Active
                     _hero.ChangeState(CharacterStates.Active);
-
-                    // 2. Occupation = Lord
                     _hero.SetNewOccupation(Occupation.Lord);
 
-                    // 3. Жених: если у него нет клана — добавляем в клан игрока.
-                    //    Бывает, если сторонний мод «повысил» его до лорда,
-                    //    но не позаботился о клане.
                     if (PeasantsBehavior.selectedHero.Clan == null)
                     {
                         PeasantsBehavior.selectedHero.Clan = Hero.MainHero.Clan;
                     }
 
-                    // 4. Невеста: добавляем в клан жениха
-                    //    (или в клан игрока, если у жениха клана всё ещё нет).
                     Clan targetClan = PeasantsBehavior.selectedHero.Clan ?? Hero.MainHero.Clan;
                     if (_hero.Clan != targetClan)
                     {
                         _hero.Clan = targetClan;
                     }
 
-                    // Диагностика: CanMarry для обоих до брака.
                     InformationManager.DisplayMessage(new InformationMessage(
                         $"[Peasants] PRE-MARRIAGE CHECK: " +
                         $"groom={PeasantsBehavior.selectedHero.Name} " +
@@ -166,6 +177,21 @@ namespace Peasants
                 else
                 {
                     // =================== НАЁМ КОМПАНЬОНА ===================
+                    // Защитная проверка прямо перед наймом: если игрок каким-то
+                    // образом дошёл сюда, имея лимит компаньонов уже заполненным —
+                    // не нанимаем и корректно закрываем окно выбора.
+                    if (PeasantsBehavior.IsCompanionLimitReached())
+                    {
+                        InformationManager.DisplayMessage(new InformationMessage(
+                            "[Peasants] Companion limit reached — hire cancelled. " +
+                            "(Защитная проверка в Click().)",
+                            Colors.Red));
+
+                        PeasantsBehavior.CleanupUnusedCandidates(null);
+                        PeasantsBehavior.DeleteVMLayer();
+                        return;
+                    }
+
                     _hero.ChangeState(CharacterStates.Active);
                     _hero.SetNewOccupation(Occupation.Wanderer);
 
@@ -177,7 +203,9 @@ namespace Peasants
 
                     InformationManager.DisplayMessage(new InformationMessage(
                         $"[Peasants] AFTER-HIRE: occ={_hero.Occupation}, clan={Cn(_hero)}, " +
-                        $"isCompanion={_hero.CompanionOf != null}",
+                        $"isCompanion={_hero.CompanionOf != null}, " +
+                        $"totalCompanions={PeasantsBehavior.CountPlayerCompanions()}/" +
+                        $"{Clan.PlayerClan.CompanionLimit}",
                         Colors.Yellow));
 
                     _hero.SetHasMet();
@@ -192,6 +220,9 @@ namespace Peasants
                 InformationManager.DisplayMessage(new InformationMessage(
                     "[Peasants] Click EXCEPTION: " + ex.Message + "\n" + ex.StackTrace,
                     Colors.Red));
+
+                // Не оставляем окно открытым, если что-то упало посреди обработки
+                try { PeasantsBehavior.DeleteVMLayer(); } catch { /* ignore */ }
             }
         }
 

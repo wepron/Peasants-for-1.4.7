@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using TaleWorlds.CampaignSystem;
 using TaleWorlds.CampaignSystem.Actions;
 using TaleWorlds.CampaignSystem.GameMenus;
@@ -37,11 +38,89 @@ namespace Peasants
 
         // ---------------------------------------------------------------------
         // Список кандидатов, показанных в текущем окне выбора.
-        // Нужен, чтобы после выбора удалить неиспользованных героев —
-        // иначе они останутся в поселении как лишние NPC (Townsfolk) и могут
-        // вызывать те же проблемы при разговоре с ними.
+        // Нужен, чтобы после выбора удалить неиспользованных героев.
         // ---------------------------------------------------------------------
         public static List<Hero> CurrentCandidates = new List<Hero>();
+
+        // ---------------------------------------------------------------------
+        // Рефлексия на приватное поле Hero._birthDay.
+        //
+        // Зачем: HeroCreator.CreateSpecialHero(template, settlement, null, null, age)
+        // в 1.4.7 не всегда реально выставляет возраст. Из-за этого Age
+        // у только что созданного героя может быть равен "возрасту кампании",
+        // а не тому age, что мы передали. Мы выставляем BirthDay руками
+        // сразу после создания, чтобы Age == age гарантированно.
+        // ---------------------------------------------------------------------
+        private static readonly FieldInfo BirthDayField =
+            typeof(Hero).GetField("_birthDay",
+                BindingFlags.Instance | BindingFlags.NonPublic);
+
+        // ---------------------------------------------------------------------
+        // Лимит компаньонов.
+        //
+        // ВАЖНО: НЕ используем Clan.PlayerClan.Companions.Count — это
+        // кэшированный список, который на старте кампании (до открытия
+        // вкладки клана) остаётся пустым и позволяет нанимать бесконечно.
+        //
+        // Считаем напрямую по всем живым героям мира, у которых
+        // CompanionOf == PlayerClan. Это единственный источник, который
+        // обновляется сразу после AddCompanionAction.Apply.
+        // ---------------------------------------------------------------------
+        public static int CountPlayerCompanions()
+        {
+            try
+            {
+                Clan player = Clan.PlayerClan;
+                if (player == null) return 0;
+
+                int count = 0;
+
+                if (Campaign.Current != null && Campaign.Current.AliveHeroes != null)
+                {
+                    foreach (Hero h in Campaign.Current.AliveHeroes)
+                    {
+                        try
+                        {
+                            if (h == null) continue;
+                            if (!h.IsAlive) continue;
+                            if (h.CompanionOf == player) count++;
+                        }
+                        catch
+                        {
+                            // Пропускаем кривого героя, не валим весь подсчёт.
+                        }
+                    }
+                }
+
+                return count;
+            }
+            catch (Exception ex)
+            {
+                InformationManager.DisplayMessage(new InformationMessage(
+                    "[Peasants] CountPlayerCompanions error: " + ex.Message, Colors.Red));
+                return 0;
+            }
+        }
+
+        public static bool IsCompanionLimitReached()
+        {
+            try
+            {
+                Clan player = Clan.PlayerClan;
+                if (player == null) return false;
+
+                int limit = player.CompanionLimit;
+                int current = CountPlayerCompanions();
+
+                return current >= limit;
+            }
+            catch (Exception ex)
+            {
+                InformationManager.DisplayMessage(new InformationMessage(
+                    "[Peasants] IsCompanionLimitReached error: " + ex.Message, Colors.Red));
+                return false;
+            }
+        }
 
         // ---------------------------------------------------------------------
         // UI: создание и удаление Gauntlet-слоя
@@ -74,6 +153,9 @@ namespace Peasants
             {
                 InformationManager.DisplayMessage(new InformationMessage(
                     "[Peasants] CreateVMLayer error: " + ex.Message, Colors.Red));
+
+                // Не оставляем слой висеть в полусобранном состоянии
+                try { DeleteVMLayer(); } catch { /* ignore */ }
             }
         }
 
@@ -93,7 +175,10 @@ namespace Peasants
                         layer.ReleaseMovie(gauntletMovie);
                     }
 
-                    topScreen.RemoveLayer(layer);
+                    if (topScreen != null)
+                    {
+                        topScreen.RemoveLayer(layer);
+                    }
                 }
 
                 layer = null;
@@ -109,7 +194,7 @@ namespace Peasants
 
         // ---------------------------------------------------------------------
         // Удаление неиспользованных кандидатов.
-        // Вызывается из CharacterCard.Click() после того, как выбран один герой.
+        // chosen == null — "закрытие без выбора", удаляем всех.
         // ---------------------------------------------------------------------
         public static void CleanupUnusedCandidates(Hero chosen)
         {
@@ -128,10 +213,12 @@ namespace Peasants
                         // и без уведомления игроку.
                         KillCharacterAction.ApplyByRemove(c, false);
                     }
-                    catch
+                    catch (Exception ex)
                     {
-                        // Если API отличается — молча игнорируем,
-                        // чтобы не сорвать основной сценарий.
+                        InformationManager.DisplayMessage(new InformationMessage(
+                            "[Peasants] Cleanup failed for " +
+                            (c.Name?.ToString() ?? "?") + ": " + ex.Message,
+                            Colors.Red));
                     }
                 }
 
@@ -150,7 +237,6 @@ namespace Peasants
         public override void RegisterEvents()
         {
             CampaignEvents.OnSessionLaunchedEvent.AddNonSerializedListener(this, AddMenuItems);
-            CampaignEvents.DailyTickEvent.AddNonSerializedListener(this, TickDaily);
         }
 
         public override void SyncData(IDataStore dataStore)
@@ -158,71 +244,49 @@ namespace Peasants
         }
 
         // ---------------------------------------------------------------------
-        // Ежедневный тик: чистим "зависшие" состояния у мёртвых/отключённых.
-        // Наших текущих кандидатов пропускаем — иначе игра может
-        // превратить их в Headman раньше, чем игрок успеет выбрать.
-        // ---------------------------------------------------------------------
-        private void TickDaily()
-        {
-            try
-            {
-                foreach (Hero hero in Campaign.Current.DeadOrDisabledHeroes)
-                {
-                    // защита: не трогаем кандидатов, которых мы только что создали
-                    if (CurrentCandidates != null && CurrentCandidates.Contains(hero))
-                        continue;
-
-                    bool isTownsfolk = hero.IsAlive && hero.Occupation == Occupation.Townsfolk;
-                    bool isVillager = hero.Occupation == Occupation.Villager;
-
-                    if (isTownsfolk || isVillager)
-                    {
-                        hero.ChangeState(CharacterStates.Active);
-                        hero.SetNewOccupation(Occupation.Headman);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                InformationManager.DisplayMessage(new InformationMessage(
-                    "[Peasants] TickDaily error: " + ex.Message, Colors.Red));
-            }
-        }
-
-        // ---------------------------------------------------------------------
         // Пункты меню в деревне
         // ---------------------------------------------------------------------
         private void AddMenuItems(CampaignGameStarter campaignGameStarter)
         {
-            // --- "Arrange a marriage" ---
-            campaignGameStarter.AddGameMenuOption(
-                "village",
-                "marry_peasant",
-                "Arrange a marriage",
-                args =>
-                {
-                    args.optionLeaveType = GameMenuOption.LeaveType.Submenu;
-                    args.IsEnabled = true;
-                    args.Tooltip = new TextObject("Marry a family member to a local peasant", null);
-                    return true;
-                },
-                args => { ShowFamilyList(); },
-                false, 1, false, null);
+            try
+            {
+                // --- "Arrange a marriage" ---
+                campaignGameStarter.AddGameMenuOption(
+                    "village",
+                    "marry_peasant",
+                    "Arrange a marriage",
+                    args =>
+                    {
+                        args.optionLeaveType = GameMenuOption.LeaveType.Submenu;
+                        args.IsEnabled = true;
+                        args.Tooltip = new TextObject("Marry a family member to a local peasant", null);
+                        return true;
+                    },
+                    args => { ShowFamilyList(); },
+                    false, 1, false, null);
 
-            // --- "Recruit a companion" ---
-            campaignGameStarter.AddGameMenuOption(
-                "village",
-                "recruit_peasant",
-                "Recruit a companion",
-                args =>
-                {
-                    args.optionLeaveType = GameMenuOption.LeaveType.Submenu;
-                    args.IsEnabled = true;
-                    args.Tooltip = new TextObject("Hire a peasant Companion", null);
-                    return Clan.PlayerClan.CompanionLimit > Clan.PlayerClan.Companions.Count;
-                },
-                args => { HirePeasant(); },
-                false, 1, false, null);
+                // --- "Recruit a companion" ---
+                // Видимость через IsCompanionLimitReached() — не через
+                // Clan.PlayerClan.Companions, у которого кэш протухает.
+                campaignGameStarter.AddGameMenuOption(
+                    "village",
+                    "recruit_peasant",
+                    "Recruit a companion",
+                    args =>
+                    {
+                        args.optionLeaveType = GameMenuOption.LeaveType.Submenu;
+                        args.IsEnabled = true;
+                        args.Tooltip = new TextObject("Hire a peasant Companion", null);
+                        return !IsCompanionLimitReached();
+                    },
+                    args => { HirePeasant(); },
+                    false, 1, false, null);
+            }
+            catch (Exception ex)
+            {
+                InformationManager.DisplayMessage(new InformationMessage(
+                    "[Peasants] AddMenuItems error: " + ex.Message, Colors.Red));
+            }
         }
 
         // ---------------------------------------------------------------------
@@ -236,18 +300,26 @@ namespace Peasants
 
                 foreach (Hero hero in Campaign.Current.AliveHeroes)
                 {
-                    bool suitable =
-                        hero.Clan == Hero.MainHero.Clan &&
-                        hero.Age >= 18f &&
-                        hero.Spouse == null &&
-                        hero.Occupation == Occupation.Lord;
+                    try
+                    {
+                        bool suitable =
+                            hero.Clan == Hero.MainHero.Clan &&
+                            hero.Age >= 18f &&
+                            hero.Spouse == null &&
+                            hero.Occupation == Occupation.Lord;
 
-                    if (!suitable) continue;
+                        if (!suitable) continue;
 
-                    inquiryElements.Add(new InquiryElement(
-                        hero.CharacterObject.HeroObject,
-                        hero.Name + " - " + hero.Age.ToString("0"),
-                        new CharacterImageIdentifier(CharacterCode.CreateFrom(hero.CharacterObject))));
+                        inquiryElements.Add(new InquiryElement(
+                            hero.CharacterObject.HeroObject,
+                            hero.Name + " - " + hero.Age.ToString("0"),
+                            new CharacterImageIdentifier(CharacterCode.CreateFrom(hero.CharacterObject))));
+                    }
+                    catch (Exception ex)
+                    {
+                        InformationManager.DisplayMessage(new InformationMessage(
+                            "[Peasants] Skipped hero in family list: " + ex.Message, Colors.Red));
+                    }
                 }
 
                 if (inquiryElements.Count < 1)
@@ -263,32 +335,39 @@ namespace Peasants
                     return;
                 }
 
-                // 1.4.7: MultiSelectionInquiryData имеет новую сигнатуру
                 MBInformationManager.ShowMultiSelectionInquiry(
                     new MultiSelectionInquiryData(
-                        "Members Suitable For Marriage",   // titleText
-                        "",                                 // descriptionText
-                        inquiryElements,                    // List<InquiryElement>
-                        true,                               // isExitShown
-                        1,                                  // minSelectableOptionCount
-                        1,                                  // maxSelectableOptionCount
-                        "Continue",                         // affirmativeText
-                        null,                               // negativeText
-                        args =>                             // affirmativeAction
+                        "Members Suitable For Marriage",
+                        "",
+                        inquiryElements,
+                        true,
+                        1,
+                        1,
+                        "Continue",
+                        null,
+                        args =>
                         {
-                            if (args == null || !args.Any()) return;
-
-                            InformationManager.HideInquiry();
-
-                            SubModule.ExecuteActionOnNextTick(() =>
+                            try
                             {
-                                Hero picked = args.Select(e => e.Identifier as Hero).FirstOrDefault();
-                                if (picked != null) Part2(picked);
-                            });
+                                if (args == null || !args.Any()) return;
+
+                                InformationManager.HideInquiry();
+
+                                SubModule.ExecuteActionOnNextTick(() =>
+                                {
+                                    Hero picked = args.Select(e => e.Identifier as Hero).FirstOrDefault();
+                                    if (picked != null) Part2(picked);
+                                });
+                            }
+                            catch (Exception ex)
+                            {
+                                InformationManager.DisplayMessage(new InformationMessage(
+                                    "[Peasants] Inquiry affirmative error: " + ex.Message, Colors.Red));
+                            }
                         },
-                        null,                               // negativeAction
-                        "",                                 // soundEventPath
-                        false                               // isSearchAvailable
+                        null,
+                        "",
+                        false
                     ),
                     false,
                     false);
@@ -307,36 +386,71 @@ namespace Peasants
         {
             try
             {
+                if (Settlement.CurrentSettlement == null)
+                {
+                    InformationManager.DisplayMessage(new InformationMessage(
+                        "[Peasants] Not in a settlement — cannot arrange marriage.",
+                        Colors.Red));
+                    return;
+                }
+
                 selectedHero = hero;
 
                 List<Hero> candidates = new List<Hero>();
                 List<CharacterObject> troops = new List<CharacterObject>();
 
-                foreach (Hero notable in Settlement.CurrentSettlement.Notables)
+                try
                 {
-                    foreach (CharacterObject troop in notable.VolunteerTypes)
+                    foreach (Hero notable in Settlement.CurrentSettlement.Notables)
                     {
-                        if (troop != null && hero.IsFemale != troop.IsFemale)
+                        if (notable == null) continue;
+
+                        foreach (CharacterObject troop in notable.VolunteerTypes)
                         {
-                            troops.Add(troop);
+                            if (troop != null && hero.IsFemale != troop.IsFemale)
+                            {
+                                troops.Add(troop);
+                            }
                         }
                     }
+                }
+                catch (Exception ex)
+                {
+                    InformationManager.DisplayMessage(new InformationMessage(
+                        "[Peasants] Gathering troops error: " + ex.Message, Colors.Red));
                 }
 
                 for (int i = 0; i < 10; i++)
                 {
-                    bool tryRecruit = MBRandom.RandomInt(0, 100) > 75 && troops.Count > 0;
+                    try
+                    {
+                        // Возраст ролится ОТДЕЛЬНО для каждого кандидата.
+                        int age = PickCandidateAge(asCompanion: false);
 
-                    if (tryRecruit)
-                    {
-                        CharacterObject troop = CoreExtensions.GetRandomElement<CharacterObject>(troops);
-                        // кандидат в супруги — НЕ компаньон, occupation станет Lord после свадьбы
-                        candidates.Add(CreateRecruit(troop, asCompanion: false));
+                        bool tryRecruit = MBRandom.RandomInt(0, 100) > 75 && troops.Count > 0;
+
+                        if (tryRecruit)
+                        {
+                            CharacterObject troop = CoreExtensions.GetRandomElement<CharacterObject>(troops);
+                            candidates.Add(CreateRecruit(troop, asCompanion: false, age: age));
+                        }
+                        else
+                        {
+                            candidates.Add(CreatePeasant(!hero.IsFemale, asCompanion: false, age: age));
+                        }
                     }
-                    else
+                    catch (Exception ex)
                     {
-                        candidates.Add(CreatePeasant(!hero.IsFemale, asCompanion: false));
+                        InformationManager.DisplayMessage(new InformationMessage(
+                            "[Peasants] Candidate creation error: " + ex.Message, Colors.Red));
                     }
+                }
+
+                if (candidates.Count == 0)
+                {
+                    InformationManager.DisplayMessage(new InformationMessage(
+                        "[Peasants] No candidates could be created.", Colors.Red));
+                    return;
                 }
 
                 CurrentCandidates = candidates;
@@ -350,38 +464,99 @@ namespace Peasants
         }
 
         // ---------------------------------------------------------------------
+        // Возраст одного кандидата.
+        //
+        // asCompanion == true  → берём диапазон из группы Companions.
+        // asCompanion == false → берём диапазон из группы Brides.
+        //
+        // Если Min > Max (игрок случайно так выставил) — Max подтягивается
+        // к Min, чтобы MBRandom.RandomInt() не получал пустой интервал.
+        // ---------------------------------------------------------------------
+        private static int PickCandidateAge(bool asCompanion)
+        {
+            int min, max;
+
+            try
+            {
+                PeasantsSettings s = PeasantsSettings.Instance;
+
+                if (asCompanion)
+                {
+                    min = s != null ? s.CompanionMinAge : 22;
+                    max = s != null ? s.CompanionMaxAge : 60;
+                }
+                else
+                {
+                    min = s != null ? s.BrideMinAge : 18;
+                    max = s != null ? s.BrideMaxAge : 22;
+                }
+            }
+            catch
+            {
+                if (asCompanion) { min = 22; max = 60; }
+                else { min = 18; max = 22; }
+            }
+
+            if (min < 18) min = 18;
+            if (max > 100) max = 100;
+            if (max < min) max = min;
+
+            // MBRandom.RandomInt(min, max) — верхняя граница эксклюзивна,
+            // поэтому +1, чтобы MaxAge мог реально выпасть.
+            return MBRandom.RandomInt(min, max + 1);
+        }
+
+        // ---------------------------------------------------------------------
+        // Принудительно выставляем BirthDay так, чтобы hero.Age == years.
+        // ---------------------------------------------------------------------
+        private static void ForceSetAge(Hero hero, int years)
+        {
+            try
+            {
+                if (hero == null) return;
+                if (BirthDayField == null) return;
+
+                CampaignTime birth = CampaignTime.Now - CampaignTime.Years((float)years);
+                BirthDayField.SetValue(hero, birth);
+            }
+            catch (Exception ex)
+            {
+                InformationManager.DisplayMessage(new InformationMessage(
+                    "[Peasants] ForceSetAge error: " + ex.Message, Colors.Red));
+            }
+        }
+
+        // ---------------------------------------------------------------------
         // Создание "чистого" крестьянина (низкоуровневый герой)
         // ---------------------------------------------------------------------
-        private Hero CreatePeasant(bool isFemale, bool asCompanion)
+        private Hero CreatePeasant(bool isFemale, bool asCompanion, int age)
         {
-            Hero newHero;
-
             CharacterObject template = isFemale
                 ? Settlement.CurrentSettlement.Culture.Townswoman
                 : Settlement.CurrentSettlement.Culture.Townsman;
 
-            newHero = HeroCreator.CreateSpecialHero(
+            Hero newHero = HeroCreator.CreateSpecialHero(
                 template,
                 Settlement.CurrentSettlement,
                 null,
-                null,                            // ← без клана: MarriageAction/AddCompanionAction сами добавят
-                new Random().Next(18, 25));      // ← возраст (5-й параметр, подтверждено декомпиляцией)
+                null,
+                age);
+
+            // Гарантируем возраст независимо от того, применил ли его движок.
+            ForceSetAge(newHero, age);
 
             ApplySkillsFromTemplate(newHero, template);
 
-            List<Equipment> equipments = template.BattleEquipments.ToList();
+            // BattleEquipments может быть null у некоторых шаблонов
+            List<Equipment> equipments = template.BattleEquipments?.ToList() ?? new List<Equipment>();
             if (equipments.Count > 0)
             {
                 newHero.CharacterObject.Equipment.FillFrom(
                     CoreExtensions.GetRandomElement<Equipment>(equipments), true);
             }
 
-            // 1.4.7: 6 = Disabled -> нужно Active (1)
             newHero.ChangeState(CharacterStates.Active);
 
-            // Если создаём именно компаньона — сразу ставим Wanderer,
-            // чтобы не оставлять героя с Occupation.Townsfolk.
-            // Для кандидатов в супруги оставляем Townsfolk (после свадьбы станет Lord).
             if (asCompanion)
             {
                 newHero.SetNewOccupation(Occupation.Wanderer);
@@ -393,18 +568,21 @@ namespace Peasants
         // ---------------------------------------------------------------------
         // Создание героя по шаблону (например, из добровольцев)
         // ---------------------------------------------------------------------
-        private Hero CreateRecruit(CharacterObject template, bool asCompanion)
+        private Hero CreateRecruit(CharacterObject template, bool asCompanion, int age)
         {
             Hero newHero = HeroCreator.CreateSpecialHero(
                 template,
                 Settlement.CurrentSettlement,
                 null,
-                null,                                // ← без клана
-                new Random().Next(18, 25));          // ← возраст
+                null,
+                age);
+
+            // Гарантируем возраст независимо от того, применил ли его движок.
+            ForceSetAge(newHero, age);
 
             ApplySkillsFromTemplate(newHero, template);
 
-            List<Equipment> equipments = template.BattleEquipments.ToList();
+            List<Equipment> equipments = template.BattleEquipments?.ToList() ?? new List<Equipment>();
             if (equipments.Count > 0)
             {
                 newHero.CharacterObject.Equipment.FillFrom(
@@ -423,16 +601,13 @@ namespace Peasants
 
         // ---------------------------------------------------------------------
         // Общий помощник: производные скиллы из шаблона.
-        //
-        // В Bannerlord 1.4.7 метод GetSkillsDerivedFromTraits был удалён
-        // из DefaultCharacterDevelopmentModel, поэтому здесь ничего не делаем.
+        // В 1.4.7 метод GetSkillsDerivedFromTraits отсутствует.
         // ---------------------------------------------------------------------
         private static void ApplySkillsFromTemplate(Hero hero, CharacterObject template)
         {
             try
             {
                 if (hero == null || template == null) return;
-                // В 1.4.7 метод GetSkillsDerivedFromTraits отсутствует.
             }
             catch
             {
@@ -447,35 +622,82 @@ namespace Peasants
         {
             try
             {
+                if (Settlement.CurrentSettlement == null)
+                {
+                    InformationManager.DisplayMessage(new InformationMessage(
+                        "[Peasants] Not in a settlement — cannot hire.",
+                        Colors.Red));
+                    return;
+                }
+
+                // Защитная проверка перед открытием окна выбора.
+                // Меню деревни могло быть отрисовано до того, как игрок
+                // нанял предыдущего компаньона, поэтому здесь проверяем ещё раз.
+                if (IsCompanionLimitReached())
+                {
+                    InformationManager.DisplayMessage(new InformationMessage(
+                        "[Peasants] Companion limit reached — cannot hire more.",
+                        Colors.Red));
+                    return;
+                }
+
                 selectedHero = null;
 
                 List<Hero> candidates = new List<Hero>();
                 List<CharacterObject> troops = new List<CharacterObject>();
 
-                foreach (Hero notable in Settlement.CurrentSettlement.Notables)
+                try
                 {
-                    foreach (CharacterObject troop in notable.VolunteerTypes)
+                    foreach (Hero notable in Settlement.CurrentSettlement.Notables)
                     {
-                        if (troop != null)
+                        if (notable == null) continue;
+
+                        foreach (CharacterObject troop in notable.VolunteerTypes)
                         {
-                            troops.Add(troop);
+                            if (troop != null)
+                            {
+                                troops.Add(troop);
+                            }
                         }
                     }
+                }
+                catch (Exception ex)
+                {
+                    InformationManager.DisplayMessage(new InformationMessage(
+                        "[Peasants] Gathering troops error: " + ex.Message, Colors.Red));
                 }
 
                 for (int i = 0; i < 10; i++)
                 {
-                    bool tryRecruit = MBRandom.RandomInt(0, 100) > 75 && troops.Count > 0;
+                    try
+                    {
+                        // Возраст ролится ОТДЕЛЬНО для каждого кандидата.
+                        int age = PickCandidateAge(asCompanion: true);
 
-                    if (tryRecruit)
-                    {
-                        CharacterObject troop = CoreExtensions.GetRandomElement<CharacterObject>(troops);
-                        candidates.Add(CreateRecruit(troop, asCompanion: true));
+                        bool tryRecruit = MBRandom.RandomInt(0, 100) > 75 && troops.Count > 0;
+
+                        if (tryRecruit)
+                        {
+                            CharacterObject troop = CoreExtensions.GetRandomElement<CharacterObject>(troops);
+                            candidates.Add(CreateRecruit(troop, asCompanion: true, age: age));
+                        }
+                        else
+                        {
+                            candidates.Add(CreatePeasant(MBRandom.RandomInt(0, 100) > 50, asCompanion: true, age: age));
+                        }
                     }
-                    else
+                    catch (Exception ex)
                     {
-                        candidates.Add(CreatePeasant(MBRandom.RandomInt(0, 100) > 50, asCompanion: true));
+                        InformationManager.DisplayMessage(new InformationMessage(
+                            "[Peasants] Candidate creation error: " + ex.Message, Colors.Red));
                     }
+                }
+
+                if (candidates.Count == 0)
+                {
+                    InformationManager.DisplayMessage(new InformationMessage(
+                        "[Peasants] No candidates could be created.", Colors.Red));
+                    return;
                 }
 
                 CurrentCandidates = candidates;
