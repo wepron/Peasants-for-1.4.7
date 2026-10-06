@@ -1,7 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Reflection;
 using TaleWorlds.CampaignSystem;
 using TaleWorlds.CampaignSystem.Actions;
 using TaleWorlds.CampaignSystem.GameMenus;
@@ -41,19 +40,6 @@ namespace Peasants
         // Нужен, чтобы после выбора удалить неиспользованных героев.
         // ---------------------------------------------------------------------
         public static List<Hero> CurrentCandidates = new List<Hero>();
-
-        // ---------------------------------------------------------------------
-        // Рефлексия на приватное поле Hero._birthDay.
-        //
-        // Зачем: HeroCreator.CreateSpecialHero(template, settlement, null, null, age)
-        // в 1.4.7 не всегда реально выставляет возраст. Из-за этого Age
-        // у только что созданного героя может быть равен "возрасту кампании",
-        // а не тому age, что мы передали. Мы выставляем BirthDay руками
-        // сразу после создания, чтобы Age == age гарантированно.
-        // ---------------------------------------------------------------------
-        private static readonly FieldInfo BirthDayField =
-            typeof(Hero).GetField("_birthDay",
-                BindingFlags.Instance | BindingFlags.NonPublic);
 
         // ---------------------------------------------------------------------
         // Лимит компаньонов.
@@ -506,18 +492,49 @@ namespace Peasants
             return MBRandom.RandomInt(min, max + 1);
         }
 
-        // ---------------------------------------------------------------------
-        // Принудительно выставляем BirthDay так, чтобы hero.Age == years.
-        // ---------------------------------------------------------------------
+        // =====================================================================
+        // ПРИНУДИТЕЛЬНАЯ УСТАНОВКА ВОЗРАСТА
+        //
+        // Используем ПУБЛИЧНЫЙ Hero.SetBirthDay(CampaignTime), а НЕ рефлексию.
+        //
+        // Почему так:
+        //   Hero.SetBirthDay внутри делает:
+        //       _birthDay = birthday;
+        //       _defaultAge = birthday.IsNow ? 0.001f : _birthDay.ElapsedYearsUntilNow;
+        //
+        //   А свойство Age в 1.4.7 работает так:
+        //       if (CampaignOptions.IsLifeDeathCycleDisabled) return _defaultAge;
+        //       if (IsAlive) return _birthDay.ElapsedYearsUntilNow;
+        //
+        //   То есть, если игрок ВЫКЛЮЧИЛ старение (IsLifeDeathCycleDisabled == true),
+        //   Age берётся из _defaultAge. Если бы мы писали в _birthDay через
+        //   рефлексию, _defaultAge остался бы 65 (дефолт шаблона Townsman),
+        //   и все кандидаты выглядели бы 65-летними.
+        //
+        //   SetBirthDay обновляет ОБА поля сразу — поэтому корректно работает
+        //   при любом значении IsLifeDeathCycleDisabled.
+        //
+        // Формула:
+        //   CampaignTime.YearsFromNow(-years) = точка ровно на `years` лет НАЗАД
+        //   от текущего момента. НЕ путать с CampaignTime.Years(years), который
+        //   даёт "years лет от старта кампании" — именно из-за этой путаницы
+        //   возраст раньше уезжал на "+30 лет".
+        // =====================================================================
         private static void ForceSetAge(Hero hero, int years)
         {
+            if (hero == null) return;
+
             try
             {
-                if (hero == null) return;
-                if (BirthDayField == null) return;
+                // Гарантируем, что герой активен: движок не перезаписывает
+                // BirthDay / DefaultAge у активного героя.
+                if (hero.HeroState != CharacterStates.Active)
+                {
+                    hero.ChangeState(CharacterStates.Active);
+                }
 
-                CampaignTime birth = CampaignTime.Now - CampaignTime.Years((float)years);
-                BirthDayField.SetValue(hero, birth);
+                // Публичный метод. Обновляет и _birthDay, и _defaultAge.
+                hero.SetBirthDay(CampaignTime.YearsFromNow(-years));
             }
             catch (Exception ex)
             {
@@ -542,10 +559,9 @@ namespace Peasants
                 null,
                 age);
 
-            // Гарантируем возраст независимо от того, применил ли его движок.
+            // Порядок важен: активируем и ставим BirthDay/DefaultAge.
+            // ForceSetAge сам делает ChangeState(Active), если ещё не активен.
             ForceSetAge(newHero, age);
-
-            ApplySkillsFromTemplate(newHero, template);
 
             // BattleEquipments может быть null у некоторых шаблонов
             List<Equipment> equipments = template.BattleEquipments?.ToList() ?? new List<Equipment>();
@@ -554,8 +570,6 @@ namespace Peasants
                 newHero.CharacterObject.Equipment.FillFrom(
                     CoreExtensions.GetRandomElement<Equipment>(equipments), true);
             }
-
-            newHero.ChangeState(CharacterStates.Active);
 
             if (asCompanion)
             {
@@ -577,10 +591,8 @@ namespace Peasants
                 null,
                 age);
 
-            // Гарантируем возраст независимо от того, применил ли его движок.
+            // Порядок важен: активируем и ставим BirthDay/DefaultAge.
             ForceSetAge(newHero, age);
-
-            ApplySkillsFromTemplate(newHero, template);
 
             List<Equipment> equipments = template.BattleEquipments?.ToList() ?? new List<Equipment>();
             if (equipments.Count > 0)
@@ -589,30 +601,12 @@ namespace Peasants
                     CoreExtensions.GetRandomElement<Equipment>(equipments), true);
             }
 
-            newHero.ChangeState(CharacterStates.Active);
-
             if (asCompanion)
             {
                 newHero.SetNewOccupation(Occupation.Wanderer);
             }
 
             return newHero;
-        }
-
-        // ---------------------------------------------------------------------
-        // Общий помощник: производные скиллы из шаблона.
-        // В 1.4.7 метод GetSkillsDerivedFromTraits отсутствует.
-        // ---------------------------------------------------------------------
-        private static void ApplySkillsFromTemplate(Hero hero, CharacterObject template)
-        {
-            try
-            {
-                if (hero == null || template == null) return;
-            }
-            catch
-            {
-                // ignore
-            }
         }
 
         // ---------------------------------------------------------------------
