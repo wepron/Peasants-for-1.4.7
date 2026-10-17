@@ -23,7 +23,7 @@ namespace Peasants
 {
     // =========================================================================
     // PeasantsBehavior — основной CampaignBehavior мода Peasants.
-    // Адаптирован под Mount & Blade II: Bannerlord 1.4.7.
+    // Адаптирован под Mount & Blade II Bannerlord 1.4.7.
     // =========================================================================
     internal class PeasantsBehavior : CampaignBehaviorBase
     {
@@ -543,6 +543,135 @@ namespace Peasants
             }
         }
 
+        // =====================================================================
+        // УНИКАЛЬНАЯ ВНЕШНОСТЬ
+        //
+        // Раньше все кандидаты из одного шаблона (Townsman/Townswoman) выглядели
+        // одинаково — HeroCreator.CreateSpecialHero копирует BodyProperties
+        // из шаблона, и без дополнительной рандомизации лица у всех были
+        // "одно лицо".
+        //
+        // Что делает метод:
+        //   1. Берёт min/max BodyProperties ИЗ ШАБЛОНА (не из newHero!).
+        //      returnBaseValue: true ОБЯЗАТЕЛЕН: без него для героя
+        //      CharacterObject.GetBodyPropertiesMin() возвращает
+        //      HeroObject.BodyProperties (замкнутый круг).
+        //   2. Генерит уникальное лицо через FaceGen.GetRandomBodyProperties
+        //      с уникальным seed на каждого кандидата.
+        //   3. Дополнительно рандомит причёску и бороду по культурному пулу
+        //      через BodyPropertiesModel.GetHairIndicesForCulture /
+        //      GetBeardIndicesForCulture — ровно так движок делает
+        //      для детей в DefaultHeroCreationModel.GetStaticBodyProperties.
+        //   4. Применяет результат к Hero НАПРЯМУЮ через
+        //      StaticBodyProperties/Weight/Build.
+        //      CharacterObject.UpdatePlayerCharacterBodyProperties для NPC —
+        //      no-op (внутри "if (IsPlayerCharacter && IsHero)").
+        //
+        // variationAmount = 0.5f — золотая середина между "похожие" (0f)
+        // и "уродцы" (1f). Если после теста лица слишком похожи — поднять
+        // до 0.75f/1f. Если странные — снизить до 0.35f/0f.
+        // =====================================================================
+        private static void ApplyRandomAppearance(Hero hero, CharacterObject template, bool isFemale)
+        {
+            if (hero == null || template == null) return;
+
+            try
+            {
+                // 1. Границы шаблона. returnBaseValue: true — КРИТИЧНО.
+                BodyProperties min = template.GetBodyPropertiesMin(returnBaseValue: true);
+                BodyProperties max = template.GetBodyPropertiesMax(returnBaseValue: true);
+
+                // 2. Теги. У женщин бороду не просим.
+                var range = template.BodyPropertyRange;
+                string hairTags = range?.HairTags ?? "";
+                string beardTags = isFemale ? "" : (range?.BeardTags ?? "");
+                string tattooTags = range?.TattooTags ?? "";
+
+                // 3. Генерим уникальное лицо.
+                BodyProperties random = FaceGen.GetRandomBodyProperties(
+                    template.Race,
+                    isFemale,
+                    min,
+                    max,
+                    0,                          // hairCoverType
+                    MBRandom.RandomInt(),       // уникальный seed на каждого
+                    hairTags,
+                    beardTags,
+                    tattooTags,
+                    0.5f);                      // variationAmount — золотая середина
+
+                // 4. Дополнительно рандомим причёску и бороду по культуре.
+                //    Идея взята из DefaultHeroCreationModel.GetStaticBodyProperties:
+                //    когда у шаблона пустые hair/beard-теги, движок берёт
+                //    индексы из Campaign.Current.Models.BodyPropertiesModel
+                //    по расе/полу/возрасту/культуре.
+                //
+                //    Мы делаем это ВСЕГДА, даже если теги заданы — иначе
+                //    набор причёсок у Townsman/Townswoman слишком узкий
+                //    и все кандидаты выглядят как братья-близнецы.
+                int hair = -1;
+                int beard = -1;
+
+                try
+                {
+                    var bpModel = Campaign.Current?.Models?.BodyPropertiesModel;
+                    if (bpModel != null)
+                    {
+                        CultureObject culture = template.Culture;
+                        int gender = isFemale ? 1 : 0;
+
+                        int[] hairArr = bpModel.GetHairIndicesForCulture(
+                            template.Race, gender, template.Age, culture);
+                        if (hairArr != null && hairArr.Length > 0)
+                        {
+                            hair = hairArr[MBRandom.RandomInt(hairArr.Length)];
+                        }
+
+                        if (!isFemale)
+                        {
+                            int[] beardArr = bpModel.GetBeardIndicesForCulture(
+                                template.Race, gender, template.Age, culture);
+                            if (beardArr != null && beardArr.Length > 0)
+                            {
+                                beard = beardArr[MBRandom.RandomInt(beardArr.Length)];
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    InformationManager.DisplayMessage(new InformationMessage(
+                        "[Peasants] Random hair/beard error: " + ex.Message, Colors.Red));
+                }
+
+                // 5. Применяем причёску/бороду к телу.
+                //    tattoo = -1 — не трогаем, оставляем как дал GetRandomBodyProperties.
+                if (hair > -1 || beard > -1)
+                {
+                    FaceGen.SetHair(ref random, hair, beard, -1);
+                }
+
+                // 6. Применяем статику напрямую через Hero.
+                hero.StaticBodyProperties = random.StaticProperties;
+
+                // 7. Weight/Build — отдельно, как делает движок
+                //    (см. CharacterHelper.GetDynamicBodyPropertiesBetweenMinMaxRange).
+                //    min/max на случай, если в шаблоне они перепутаны.
+                float minWeight = MathF.Min(min.Weight, max.Weight);
+                float maxWeight = MathF.Max(min.Weight, max.Weight);
+                float minBuild = MathF.Min(min.Build, max.Build);
+                float maxBuild = MathF.Max(min.Build, max.Build);
+
+                hero.Weight = MBRandom.RandomFloatRanged(minWeight, maxWeight);
+                hero.Build = MBRandom.RandomFloatRanged(minBuild, maxBuild);
+            }
+            catch (Exception ex)
+            {
+                InformationManager.DisplayMessage(new InformationMessage(
+                    "[Peasants] ApplyRandomAppearance error: " + ex.Message, Colors.Red));
+            }
+        }
+
         // ---------------------------------------------------------------------
         // Создание "чистого" крестьянина (низкоуровневый герой)
         // ---------------------------------------------------------------------
@@ -562,6 +691,11 @@ namespace Peasants
             // Порядок важен: активируем и ставим BirthDay/DefaultAge.
             // ForceSetAge сам делает ChangeState(Active), если ещё не активен.
             ForceSetAge(newHero, age);
+
+            // Уникальная внешность. Передаём ИМЕННО template — если передать
+            // newHero.CharacterObject, GetBodyPropertiesMin() без returnBaseValue
+            // вернёт HeroObject.BodyProperties.
+            ApplyRandomAppearance(newHero, template, isFemale);
 
             // BattleEquipments может быть null у некоторых шаблонов
             List<Equipment> equipments = template.BattleEquipments?.ToList() ?? new List<Equipment>();
@@ -593,6 +727,9 @@ namespace Peasants
 
             // Порядок важен: активируем и ставим BirthDay/DefaultAge.
             ForceSetAge(newHero, age);
+
+            // Уникальная внешность. Пол берём из шаблона.
+            ApplyRandomAppearance(newHero, template, template.IsFemale);
 
             List<Equipment> equipments = template.BattleEquipments?.ToList() ?? new List<Equipment>();
             if (equipments.Count > 0)
